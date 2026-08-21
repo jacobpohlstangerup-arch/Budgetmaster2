@@ -1,4 +1,4 @@
-# Budgetmaster2
+#Budget Master
 <!DOCTYPE html>
 <html lang="da">
 <head>
@@ -1494,13 +1494,33 @@ window.exportPDF=function(){
   const isDa=lang==='da';
   const dateStr=new Date().toLocaleDateString(isDa?'da-DK':'en-GB');
   const isEUR=currency==='EUR';
-  const curSym=isEUR?'€':'kr.';
+  const curSym=isEUR?'EUR':'kr.';
 
-  // ── Currency formatter for PDF (respects UI currency selection) ──
+  // ── ASCII sanitizer ──
+  // jsPDF standard fonts use WinAnsi encoding. Any character outside it (U+2212
+  // minus, U+00A0 nbsp, smart quotes, em dash, euro sign) forces jsPDF into a
+  // UTF-16 path, which renders as a stray quote mark plus null-byte "letter
+  // spacing". Everything written to the PDF must pass through this first.
+  function pdfTxt(s){
+    return String(s==null?'':s)
+      .replace(/\u2212/g,'-')        // minus sign  -> hyphen
+      .replace(/\u00a0/g,' ')        // nbsp        -> space
+      .replace(/[\u2013\u2014]/g,'-') // en/em dash  -> hyphen
+      .replace(/[\u2018\u2019]/g,"'")
+      .replace(/[\u201c\u201d]/g,'"')
+      .replace(/\u2026/g,'...')
+      .replace(/\u00b7/g,'-')
+      .replace(/\u2248/g,'~')
+      .replace(/\u20ac/g,'EUR');     // euro sign   -> EUR
+  }
+
+  // ── Currency formatter for PDF (pure ASCII output) ──
   function pdfFmt(dkk){
     const v=isEUR?Math.round(dkk/eurRate):Math.round(dkk);
+    const neg=v<0;
     const s=Math.abs(v).toLocaleString('da-DK');
-    return isEUR?`€\u00a0${s}`:`${s}\u00a0kr.`;
+    const body=isEUR?('EUR '+s):(s+' kr.');
+    return (neg?'-':'')+body;
   }
 
   const gt=grandTotal(); // always in DKK
@@ -1514,42 +1534,48 @@ window.exportPDF=function(){
   doc.setFillColor(...RED);doc.rect(0,0,PAGE_W,20,'F');
   doc.setTextColor(255,255,255);
   doc.setFontSize(13);doc.setFont(undefined,'bold');
-  doc.text(isDa?'Forskningsbudget':'Research Budget',MARGIN+2,12);
-  if(projTitle){doc.setFontSize(9);doc.setFont(undefined,'normal');doc.text(projTitle,MARGIN+2,18);}
+  doc.text(pdfTxt(isDa?'Forskningsbudget':'Research Budget'),MARGIN+2,12);
+  if(projTitle){doc.setFontSize(9);doc.setFont(undefined,'normal');doc.text(pdfTxt(projTitle),MARGIN+2,18);}
   doc.setFontSize(8);doc.setFont(undefined,'normal');
   doc.text(dateStr,PAGE_W-MARGIN,12,{align:'right'});
   const metaLine=[];
-  if(isEUR) metaLine.push(`${curSym} (1 EUR = ${eurRate} DKK)`);
+  if(isEUR) metaLine.push(`EUR (1 EUR = ${eurRate} DKK)`);
   if(inflationPct>0) metaLine.push(isDa?`Lønstigning: ${inflationPct}%/år`:`Salary increase: ${inflationPct}%/yr`);
   if(overheadPct>0) metaLine.push(`Overhead: ${overheadPct}%`);
-  if(metaLine.length>0) doc.text(metaLine.join(' · '),PAGE_W-MARGIN,18,{align:'right'});
+  if(metaLine.length>0) doc.text(pdfTxt(metaLine.join(' | ')),PAGE_W-MARGIN,18,{align:'right'});
 
   let yPos=26;
 
-  // ── Fixed column widths — identical for ALL categories ──
-  // Layout: Sub | Inst | Desc | [FTE_y]? | Bud_y | ... | Total
-  // We always include FTE columns for hasFte cats. For non-FTE cats, no FTE col.
-  // To keep Budget columns same width across cats, we compute BUD_W using hasFte layout
-  // and apply the same BUD_W to non-FTE cats.
-  const SUB=44, INST_C=14, DESC_W=34, TOT=30;
-  const FIXED=SUB+INST_C+DESC_W+TOT; // 122mm
-  const FTE_W_FTE=13; // FTE col width when category hasFte
-  // Compute BUD_W as if we have the max columns (hasFte, 5 years) — then reuse same BUD_W
-  // For the actual category, non-FTE cats get more space per budget col naturally
-  // but we force same BUD_W for visual consistency
-  const maxFteCols=yr.length; // FTE col appears yr.length times for hasFte cats
-  // Budget width: remaining after fixed and FTE cols, divided by year count
-  // For hasFte: TBL_W - FIXED - yr.length*FTE_W_FTE split among yr.length bud cols
-  // For non-FTE: TBL_W - FIXED split among yr.length bud cols
-  // We set BUD_W to the hasFte value so columns are consistent
-  const remForBud_fte = TBL_W - FIXED - yr.length*FTE_W_FTE;
-  const BUD_W = Math.floor(remForBud_fte / yr.length);
-  // For non-FTE cats, distribute extra (FTE_W*yrs) proportionally into budget cols
-  const BUD_W_NOFTE = Math.floor((TBL_W - FIXED) / yr.length);
-  // Rounding remainders
-  function budRemainder(hasFte){
-    const rem=hasFte?(TBL_W-FIXED-yr.length*FTE_W_FTE-yr.length*BUD_W):(TBL_W-FIXED-yr.length*BUD_W_NOFTE);
-    return rem;
+  // ── Unified typography ──
+  // One base size for every cell so nothing looks visually louder than its neighbours.
+  // Emphasis is carried by weight and fill colour only, never by size.
+  const FS = 8;          // base font size for all table text
+  const ROW_H = 6.5;     // uniform body row height (mm)
+  const HEAD_H = 7.5;    // header row height (mm)
+  const PAD = [1.8, 2.5];// [vertical, horizontal] cell padding
+
+  // ── Column widths — adaptive, but identical structure for every category ──
+  // Institution must never wrap: "Rigshospitalet" needs ~24mm at 8pt.
+  const nY = yr.length;
+  const INST_C = 25;                       // wide enough for "Rigshospitalet" on one line
+  const TOT    = nY >= 4 ? 27 : 30;
+  const SUB    = nY >= 4 ? 38 : 44;
+  const FTE_W_FTE = nY >= 4 ? 11 : 13;
+  const BUD_MAX = 34;                      // stop budget cols becoming absurdly wide
+
+  // Compute budget width for FTE layout, then let description absorb any slack
+  function layoutFor(hasFte){
+    const fteTotal = hasFte ? nY * FTE_W_FTE : 0;
+    let desc = nY >= 4 ? 26 : 34;
+    let avail = TBL_W - SUB - INST_C - desc - TOT - fteTotal;
+    let bud = Math.floor(avail / nY);
+    if (bud > BUD_MAX) {           // give surplus back to the description column
+      desc += (bud - BUD_MAX) * nY;
+      bud = BUD_MAX;
+    }
+    const used = SUB + INST_C + desc + TOT + fteTotal + bud * nY;
+    const rem = TBL_W - used;      // rounding remainder goes on the last budget column
+    return { desc, bud, rem };
   }
 
   // ── Per category ──
@@ -1571,17 +1597,17 @@ window.exportPDF=function(){
     doc.rect(MARGIN,yPos,TBL_W,7,'F');
     doc.setTextColor(255,255,255);
     doc.setFontSize(9);doc.setFont(undefined,'bold');
-    doc.text(catLabel(cat).toUpperCase(),MARGIN+3,yPos+5);
+    doc.text(pdfTxt(catLabel(cat).toUpperCase()),MARGIN+3,yPos+5);
     yPos+=7;
     if(cat.desc){
-      doc.setTextColor(...GREY2);doc.setFontSize(7.5);doc.setFont(undefined,'italic');
-      const lines=doc.splitTextToSize(cat.desc,TBL_W-6);
+      doc.setTextColor(...GREY2);doc.setFontSize(FS-0.5);doc.setFont(undefined,'italic');
+      const lines=doc.splitTextToSize(pdfTxt(cat.desc),TBL_W-6);
       doc.text(lines,MARGIN+3,yPos+4);
       yPos+=lines.length*4+3;
     }
 
-    const bw=cat.hasFte?BUD_W:BUD_W_NOFTE;
-    const brem=budRemainder(cat.hasFte);
+    const L = layoutFor(cat.hasFte);
+    const bw = L.bud, brem = L.rem, DESC_W = L.desc;
 
     // ── Build header ──
     // hasFte: two-row header (year group spans FTE+Budget cols).
@@ -1590,31 +1616,31 @@ window.exportPDF=function(){
     let headArr;
     if(cat.hasFte){
       const hr1=[
-        {content:T[lang].sub,  rowSpan:2,styles:{valign:'middle',halign:'left',fontStyle:'bold'}},
-        {content:T[lang].inst, rowSpan:2,styles:{valign:'middle',halign:'center',fontStyle:'bold'}},
-        {content:T[lang].desc, rowSpan:2,styles:{valign:'middle',halign:'left',fontStyle:'bold'}},
+        {content:pdfTxt(T[lang].sub),  rowSpan:2,styles:{valign:'middle',halign:'left'}},
+        {content:pdfTxt(T[lang].inst), rowSpan:2,styles:{valign:'middle',halign:'center'}},
+        {content:pdfTxt(T[lang].desc), rowSpan:2,styles:{valign:'middle',halign:'left'}},
       ];
       yr.forEach(y=>{
-        hr1.push({content:T[lang].yr(y),colSpan:2,styles:{halign:'center',fillColor:[195,215,245],fontStyle:'bold'}});
+        hr1.push({content:pdfTxt(T[lang].yr(y)),colSpan:2,styles:{halign:'center',valign:'middle',fillColor:[195,215,245],textColor:[12,45,100]}});
       });
-      hr1.push({content:T[lang].total,rowSpan:2,styles:{halign:'right',valign:'middle',fontStyle:'bold'}});
+      hr1.push({content:pdfTxt(T[lang].total),rowSpan:2,styles:{halign:'right',valign:'middle'}});
       const hr2=[];
       yr.forEach(()=>{
-        hr2.push({content:T[lang].fte,styles:{halign:'right'}});
-        hr2.push({content:T[lang].budget+' ('+curSym+')',styles:{halign:'right'}});
+        hr2.push({content:pdfTxt(T[lang].fte),styles:{halign:'right',valign:'middle'}});
+        hr2.push({content:pdfTxt(T[lang].budget+' ('+curSym+')'),styles:{halign:'right',valign:'middle'}});
       });
       headArr=[hr1,hr2];
     } else {
-      // Single flat header row — no rowSpan, no colSpan issues
+      // Single flat header row — no rowSpan (would swallow the first body row)
       const sr=[
-        {content:T[lang].sub,  styles:{halign:'left',fontStyle:'bold'}},
-        {content:T[lang].inst, styles:{halign:'center',fontStyle:'bold'}},
-        {content:T[lang].desc, styles:{halign:'left',fontStyle:'bold'}},
+        {content:pdfTxt(T[lang].sub),  styles:{halign:'left',valign:'middle'}},
+        {content:pdfTxt(T[lang].inst), styles:{halign:'center',valign:'middle'}},
+        {content:pdfTxt(T[lang].desc), styles:{halign:'left',valign:'middle'}},
       ];
       yr.forEach(y=>{
-        sr.push({content:T[lang].yr(y)+'\n'+T[lang].budget+' ('+curSym+')',styles:{halign:'right',fillColor:[195,215,245],fontStyle:'bold'}});
+        sr.push({content:pdfTxt(T[lang].yr(y)+' '+T[lang].budget+' ('+curSym+')'),styles:{halign:'right',valign:'middle',fillColor:[195,215,245],textColor:[12,45,100]}});
       });
-      sr.push({content:T[lang].total,styles:{halign:'right',fontStyle:'bold'}});
+      sr.push({content:pdfTxt(T[lang].total),styles:{halign:'right',valign:'middle'}});
       headArr=[sr];
     }
 
@@ -1622,60 +1648,60 @@ window.exportPDF=function(){
     const bodyArr=[];
     visRows.forEach(row=>{
       const cells=[
-        {content:rowLabel(row),styles:{halign:'left'}},
-        {content:row.inst,styles:{halign:'center',fontSize:7}},
-        {content:row.desc||'',styles:{halign:'left',fontSize:7,fontStyle:'italic',textColor:GREY2}},
+        {content:pdfTxt(rowLabel(row)),styles:{halign:'left',valign:'middle'}},
+        {content:pdfTxt(row.inst),styles:{halign:'center',valign:'middle'}},
+        {content:pdfTxt(row.desc||''),styles:{halign:'left',valign:'middle',fontStyle:'italic',textColor:GREY2}},
       ];
       yr.forEach(y=>{
         if(cat.hasFte){
           const f=row.fte[y]||0;
-          cells.push({content:f>0?f.toLocaleString('da-DK',{minimumFractionDigits:1,maximumFractionDigits:1}):'-',styles:{halign:'right'}});
+          cells.push({content:f>0?f.toLocaleString('da-DK',{minimumFractionDigits:1,maximumFractionDigits:1}):'-',styles:{halign:'right',valign:'middle'}});
         }
         const b=rowBudget(row,y);
-        cells.push({content:b>0?pdfFmt(b):'-',styles:{halign:'right'}});
+        cells.push({content:b>0?pdfFmt(b):'-',styles:{halign:'right',valign:'middle'}});
       });
       let rowT=0;yr.forEach(y=>{rowT+=rowBudget(row,y);});
-      cells.push({content:rowT>0?pdfFmt(rowT):'-',styles:{halign:'right',fontStyle:'bold'}});
+      cells.push({content:rowT>0?pdfFmt(rowT):'-',styles:{halign:'right',valign:'middle',fontStyle:'bold'}});
       bodyArr.push(cells);
     });
 
     // ── Subtotal row ──
     let catT=0;visRows.forEach(row=>{yr.forEach(y=>{catT+=rowBudget(row,y);});});
     const subCells=[
-      {content:`${T[lang].subtotal} — ${catLabel(cat)}`,colSpan:3,
-       styles:{fontStyle:'bold',fillColor:BLUE_TOT,textColor:DARK,halign:'left'}}
+      {content:pdfTxt(`${T[lang].subtotal} - ${catLabel(cat)}`),colSpan:3,
+       styles:{fontStyle:'bold',fillColor:BLUE_TOT,textColor:DARK,halign:'left',valign:'middle'}}
     ];
     yr.forEach(y=>{
       if(cat.hasFte) subCells.push({content:'',styles:{fillColor:BLUE_TOT}});
       let yt=0;visRows.forEach(row=>{yt+=rowBudget(row,y);});
-      subCells.push({content:pdfFmt(yt),styles:{fontStyle:'bold',fillColor:BLUE_TOT,halign:'right',textColor:DARK}});
+      subCells.push({content:pdfFmt(yt),styles:{fontStyle:'bold',fillColor:BLUE_TOT,halign:'right',valign:'middle',textColor:DARK}});
     });
-    subCells.push({content:pdfFmt(catT),styles:{fontStyle:'bold',fillColor:BLUE_TOT,halign:'right',textColor:DARK}});
+    subCells.push({content:pdfFmt(catT),styles:{fontStyle:'bold',fillColor:BLUE_TOT,halign:'right',valign:'middle',textColor:DARK}});
     bodyArr.push(subCells);
 
     // ── Overhead row (only if overheadPct > 0) ──
     if(overheadPct>0){
       const catOh=Math.round(catT*overheadPct/100);
       const ohCells=[
-        {content:`${T[lang].overheadRow} (${overheadPct}%)`,colSpan:3,
-         styles:{fontSize:7.5,textColor:BLUE_H,fillColor:BLUE_LP,halign:'left'}}
+        {content:pdfTxt(`${T[lang].overheadRow} (${overheadPct}%)`),colSpan:3,
+         styles:{textColor:BLUE_H,fillColor:BLUE_LP,halign:'left',valign:'middle'}}
       ];
       yr.forEach(y=>{
         if(cat.hasFte) ohCells.push({content:'',styles:{fillColor:BLUE_LP}});
         let yt=0;visRows.forEach(row=>{yt+=rowBudget(row,y);});
         ohCells.push({content:pdfFmt(Math.round(yt*overheadPct/100)),
-          styles:{fontSize:7.5,halign:'right',textColor:BLUE_H,fillColor:BLUE_LP}});
+          styles:{halign:'right',valign:'middle',textColor:BLUE_H,fillColor:BLUE_LP}});
       });
       ohCells.push({content:pdfFmt(catOh),
-        styles:{fontSize:7.5,halign:'right',textColor:BLUE_H,fillColor:BLUE_LP}});
+        styles:{halign:'right',valign:'middle',textColor:BLUE_H,fillColor:BLUE_LP}});
       bodyArr.push(ohCells);
     }
 
     // ── Column styles (sum exactly to TBL_W) ──
     const cs={};let ci=0;
     cs[ci++]={cellWidth:SUB,    halign:'left'};
-    cs[ci++]={cellWidth:INST_C, halign:'center',fontSize:7};
-    cs[ci++]={cellWidth:DESC_W, halign:'left',  fontSize:7,fontStyle:'italic',textColor:GREY2};
+    cs[ci++]={cellWidth:INST_C, halign:'center'};
+    cs[ci++]={cellWidth:DESC_W, halign:'left', fontStyle:'italic', textColor:GREY2};
     yr.forEach((y,yi)=>{
       const isLast=yi===yr.length-1;
       if(cat.hasFte) cs[ci++]={cellWidth:FTE_W_FTE,halign:'right'};
@@ -1686,10 +1712,22 @@ window.exportPDF=function(){
     doc.autoTable({
       head:headArr,body:bodyArr,
       startY:yPos,margin:{left:MARGIN,right:MARGIN},tableWidth:TBL_W,
-      styles:{fontSize:8,cellPadding:[1.5,2.5],lineColor:[220,218,210],lineWidth:0.2,textColor:DARK,overflow:'linebreak'},
-      headStyles:{fillColor:BLUE_H,textColor:[255,255,255],fontStyle:'bold',fontSize:7.5,minCellHeight:9,valign:'middle'},
+      styles:{
+        font:'helvetica', fontSize:FS, cellPadding:PAD,
+        lineColor:[210,208,200], lineWidth:0.2, textColor:DARK,
+        overflow:'linebreak', valign:'middle', minCellHeight:ROW_H,
+        cellWidth:'wrap',
+      },
+      headStyles:{
+        fillColor:BLUE_H, textColor:[255,255,255], fontStyle:'bold',
+        fontSize:FS, minCellHeight:HEAD_H, valign:'middle',
+      },
+      bodyStyles:{ fontSize:FS, minCellHeight:ROW_H, valign:'middle' },
       columnStyles:cs,
       didParseCell(d){
+        // Force one uniform size on every cell — bold never changes scale
+        d.cell.styles.fontSize = FS;
+        d.cell.styles.valign   = 'middle';
         if(d.section==='body'){
           const nSpecial=overheadPct>0?2:1; // subtotal + optional overhead
           if(d.row.index < bodyArr.length - nSpecial && d.row.index%2===1){
@@ -1712,56 +1750,67 @@ window.exportPDF=function(){
     doc.rect(MARGIN,yPos,TBL_W,7,'F');
     doc.setTextColor(255,255,255);
     doc.setFontSize(9);doc.setFont(undefined,'bold');
-    doc.text(T[lang].cofinTitle.toUpperCase(),MARGIN+3,yPos+5);
+    doc.text(pdfTxt(T[lang].cofinTitle.toUpperCase()),MARGIN+3,yPos+5);
     yPos+=7;
 
     // Header: Source | Status | Year cols | Total
     const cfHead=[[
-      {content:T[lang].cofinSource,styles:{halign:'left',fontStyle:'bold'}},
-      {content:T[lang].cofinStatus,styles:{halign:'center',fontStyle:'bold'}},
-      ...yr.map(y=>({content:T[lang].yr(y),styles:{halign:'right',fontStyle:'bold',fillColor:GREEN_LIGHT,textColor:GREEN}})),
-      {content:T[lang].total,styles:{halign:'right',fontStyle:'bold'}},
+      {content:pdfTxt(T[lang].cofinSource),styles:{halign:'left',valign:'middle'}},
+      {content:pdfTxt(T[lang].cofinStatus),styles:{halign:'center',valign:'middle'}},
+      ...yr.map(y=>({content:pdfTxt(T[lang].yr(y)),styles:{halign:'right',valign:'middle',fillColor:GREEN_LIGHT,textColor:GREEN}})),
+      {content:pdfTxt(T[lang].total),styles:{halign:'right',valign:'middle'}},
     ]];
 
     const cfBody=[];
     cfRows.forEach(cf=>{
       const cells=[
-        {content:cf.source||'—',styles:{halign:'left'}},
-        {content:statusLabel(cf.status),styles:{halign:'center',fontSize:7}},
+        {content:pdfTxt(cf.source||'-'),styles:{halign:'left',valign:'middle'}},
+        {content:pdfTxt(statusLabel(cf.status)),styles:{halign:'center',valign:'middle'}},
       ];
       yr.forEach(y=>{
         const a=cf.amounts[y]||0;
-        cells.push({content:a>0?pdfFmt(a):'-',styles:{halign:'right'}});
+        cells.push({content:a>0?pdfFmt(a):'-',styles:{halign:'right',valign:'middle'}});
       });
-      cells.push({content:pdfFmt(coFinRowTotal(cf)),styles:{halign:'right',fontStyle:'bold'}});
+      cells.push({content:pdfFmt(coFinRowTotal(cf)),styles:{halign:'right',valign:'middle',fontStyle:'bold'}});
       cfBody.push(cells);
     });
 
     // Co-financing subtotal
     const cfSub=[
-      {content:T[lang].cofinSubtotal,colSpan:2,styles:{fontStyle:'bold',fillColor:GREEN_LIGHT,textColor:GREEN,halign:'left'}}
+      {content:pdfTxt(T[lang].cofinSubtotal),colSpan:2,styles:{fontStyle:'bold',fillColor:GREEN_LIGHT,textColor:GREEN,halign:'left',valign:'middle'}}
     ];
     yr.forEach(y=>{
-      cfSub.push({content:pdfFmt(coFinYear(y)),styles:{fontStyle:'bold',fillColor:GREEN_LIGHT,halign:'right',textColor:GREEN}});
+      cfSub.push({content:pdfFmt(coFinYear(y)),styles:{fontStyle:'bold',fillColor:GREEN_LIGHT,halign:'right',valign:'middle',textColor:GREEN}});
     });
-    cfSub.push({content:pdfFmt(coFinTotal()),styles:{fontStyle:'bold',fillColor:GREEN_LIGHT,halign:'right',textColor:GREEN}});
+    cfSub.push({content:pdfFmt(coFinTotal()),styles:{fontStyle:'bold',fillColor:GREEN_LIGHT,halign:'right',valign:'middle',textColor:GREEN}});
     cfBody.push(cfSub);
 
-    // Column widths — source gets remainder, status fixed, year cols equal
-    const CF_STATUS=26,CF_TOT=30;
-    const cfValW=Math.floor((TBL_W-CF_STATUS-CF_TOT-60)/yr.length);
-    const cfSrcW=TBL_W-CF_STATUS-CF_TOT-cfValW*yr.length;
-    const cfCS={0:{cellWidth:cfSrcW,halign:'left'},1:{cellWidth:CF_STATUS,halign:'center',fontSize:7}};
+    // Column widths — status fixed, year cols equal, source absorbs remainder
+    const CF_STATUS=26, CF_TOT=TOT;
+    let cfValW=Math.floor((TBL_W-CF_STATUS-CF_TOT-70)/nY);
+    if(cfValW>BUD_MAX) cfValW=BUD_MAX;
+    const cfSrcW=TBL_W-CF_STATUS-CF_TOT-cfValW*nY;
+    const cfCS={0:{cellWidth:cfSrcW,halign:'left'},1:{cellWidth:CF_STATUS,halign:'center'}};
     yr.forEach((_,i)=>{cfCS[i+2]={cellWidth:cfValW,halign:'right'};});
-    cfCS[yr.length+2]={cellWidth:CF_TOT,halign:'right',fontStyle:'bold'};
+    cfCS[nY+2]={cellWidth:CF_TOT,halign:'right',fontStyle:'bold'};
 
     doc.autoTable({
       head:cfHead,body:cfBody,
       startY:yPos,margin:{left:MARGIN,right:MARGIN},tableWidth:TBL_W,
-      styles:{fontSize:8,cellPadding:[1.5,2.5],lineColor:[157,201,174],lineWidth:0.2,textColor:DARK,overflow:'linebreak'},
-      headStyles:{fillColor:GREEN,textColor:[255,255,255],fontStyle:'bold',fontSize:7.5,minCellHeight:8},
+      styles:{
+        font:'helvetica', fontSize:FS, cellPadding:PAD,
+        lineColor:[157,201,174], lineWidth:0.2, textColor:DARK,
+        overflow:'linebreak', valign:'middle', minCellHeight:ROW_H,
+      },
+      headStyles:{
+        fillColor:GREEN, textColor:[255,255,255], fontStyle:'bold',
+        fontSize:FS, minCellHeight:HEAD_H, valign:'middle',
+      },
+      bodyStyles:{ fontSize:FS, minCellHeight:ROW_H, valign:'middle' },
       columnStyles:cfCS,
       didParseCell(d){
+        d.cell.styles.fontSize = FS;
+        d.cell.styles.valign   = 'middle';
         if(d.section==='body'&&d.row.index<cfBody.length-1&&d.row.index%2===1){
           d.cell.styles.fillColor=[245,251,247];
         }
@@ -1776,9 +1825,9 @@ window.exportPDF=function(){
 
   // Header: category name col + one col per year + total col
   const gtHead=[[
-    {content:isDa?'Kategori':'Category',styles:{fillColor:BLUE_H,textColor:[255,255,255],fontStyle:'bold',halign:'left'}},
-    ...yr.map(y=>({content:T[lang].yr(y),styles:{fillColor:BLUE_H,textColor:[255,255,255],fontStyle:'bold',halign:'right'}})),
-    {content:T[lang].total,styles:{fillColor:BLUE_H,textColor:[255,255,255],fontStyle:'bold',halign:'right'}},
+    {content:pdfTxt(isDa?'Kategori':'Category'),styles:{fillColor:BLUE_H,textColor:[255,255,255],halign:'left',valign:'middle'}},
+    ...yr.map(y=>({content:pdfTxt(T[lang].yr(y)),styles:{fillColor:BLUE_H,textColor:[255,255,255],halign:'right',valign:'middle'}})),
+    {content:pdfTxt(T[lang].total),styles:{fillColor:BLUE_H,textColor:[255,255,255],halign:'right',valign:'middle'}},
   ]];
 
   const gtBody=[];
@@ -1788,66 +1837,71 @@ window.exportPDF=function(){
       return yr.some(y=>rowBudget(row,y)>0);
     });
     if(!visRows.length)return;
-    const row=[{content:catLabel(cat),styles:{halign:'left'}}];
+    const row=[{content:pdfTxt(catLabel(cat)),styles:{halign:'left',valign:'middle'}}];
     let catT=0;
     yr.forEach(y=>{
       let yt=0;visRows.forEach(r=>{yt+=rowBudget(r,y);});
-      row.push({content:pdfFmt(yt),styles:{halign:'right'}});catT+=yt;
+      row.push({content:pdfFmt(yt),styles:{halign:'right',valign:'middle'}});catT+=yt;
     });
-    row.push({content:pdfFmt(catT),styles:{halign:'right',fontStyle:'bold'}});
+    row.push({content:pdfFmt(catT),styles:{halign:'right',valign:'middle',fontStyle:'bold'}});
     gtBody.push(row);
   });
 
-  // Grand total row
-  const totRow=[{content:isDa?'SAMLET TOTAL (ALLE ÅR)':'GRAND TOTAL (ALL YEARS)',
-    styles:{fontStyle:'bold',fontSize:9,fillColor:BLUE_TOT,textColor:DARK,halign:'left'}}];
+  // Grand total row — bold only; size stays at FS so row height matches the rest
+  const totRow=[{content:pdfTxt(isDa?'SAMLET BUDGET (ALLE ÅR)':'TOTAL BUDGET (ALL YEARS)'),
+    styles:{fontStyle:'bold',fillColor:BLUE_TOT,textColor:DARK,halign:'left',valign:'middle'}}];
   yr.forEach(y=>{
     totRow.push({content:pdfFmt(yearGrand(y)),
-      styles:{halign:'right',fontStyle:'bold',fontSize:9,fillColor:BLUE_TOT,textColor:DARK}});
+      styles:{halign:'right',valign:'middle',fontStyle:'bold',fillColor:BLUE_TOT,textColor:DARK}});
   });
   totRow.push({content:pdfFmt(gt),
-    styles:{halign:'right',fontStyle:'bold',fontSize:10,fillColor:BLUE_TOT,textColor:DARK}});
+    styles:{halign:'right',valign:'middle',fontStyle:'bold',fillColor:BLUE_TOT,textColor:DARK}});
   gtBody.push(totRow);
 
   // Overhead total (only if > 0)
   if(overheadPct>0){
-    const ohTotRow=[{content:`${T[lang].totalWithOh} (${T[lang].overheadRow} ${overheadPct}%)`,
-      styles:{fontStyle:'bold',fontSize:8.5,textColor:BLUE_H,fillColor:BLUE_LP,halign:'left'}}];
+    const ohTotRow=[{content:pdfTxt(`${T[lang].totalWithOh} (${T[lang].overheadRow} ${overheadPct}%)`),
+      styles:{fontStyle:'bold',textColor:BLUE_H,fillColor:BLUE_LP,halign:'left',valign:'middle'}}];
     yr.forEach(y=>{
       const yt=yearGrand(y);
       ohTotRow.push({content:pdfFmt(Math.round(yt*(1+overheadPct/100))),
-        styles:{halign:'right',fontStyle:'bold',fillColor:BLUE_LP,textColor:BLUE_H}});
+        styles:{halign:'right',valign:'middle',fontStyle:'bold',fillColor:BLUE_LP,textColor:BLUE_H}});
     });
     ohTotRow.push({content:pdfFmt(gt+oh),
-      styles:{halign:'right',fontStyle:'bold',fontSize:9,fillColor:BLUE_LP,textColor:BLUE_H}});
+      styles:{halign:'right',valign:'middle',fontStyle:'bold',fillColor:BLUE_LP,textColor:BLUE_H}});
     gtBody.push(ohTotRow);
   }
 
-  // ── Co-financing deduction + amount sought ──
+  // -- Co-financing deduction + amount requested --
+  // The label and figures use a plain ASCII hyphen. U+2212 (true minus) sits
+  // outside WinAnsi, which forces jsPDF into a UTF-16 path and renders as a
+  // stray quote mark followed by null-byte "letter spacing".
   const cfT=coFinTotal();
   if(cfT>0){
     const GREEN_D=[20,96,58],GREEN_L=[230,245,237];
-    const cfDedRow=[{content:T[lang].lessCofin,
-      styles:{fontStyle:'bold',fontSize:8.5,textColor:GREEN_D,fillColor:GREEN_L,halign:'left'}}];
+    const RED_L=[253,236,234],RED_D=[123,26,18];
+    const cfLabel=isDa?'- Medfinansiering':'- Co-financing';
+
+    const cfDedRow=[{content:pdfTxt(cfLabel),
+      styles:{fontStyle:'bold',textColor:GREEN_D,fillColor:GREEN_L,halign:'left',valign:'middle'}}];
     yr.forEach(y=>{
       const yc=coFinYear(y);
-      cfDedRow.push({content:yc>0?'−'+pdfFmt(yc):'-',
-        styles:{halign:'right',fontStyle:'bold',fillColor:GREEN_L,textColor:GREEN_D}});
+      cfDedRow.push({content:yc>0?('-'+pdfFmt(yc)):'-',
+        styles:{halign:'right',valign:'middle',fontStyle:'bold',fillColor:GREEN_L,textColor:GREEN_D}});
     });
-    cfDedRow.push({content:'−'+pdfFmt(cfT),
-      styles:{halign:'right',fontStyle:'bold',fontSize:9,fillColor:GREEN_L,textColor:GREEN_D}});
+    cfDedRow.push({content:'-'+pdfFmt(cfT),
+      styles:{halign:'right',valign:'middle',fontStyle:'bold',fillColor:GREEN_L,textColor:GREEN_D}});
     gtBody.push(cfDedRow);
 
-    // Amount sought — the headline figure for the funder
-    const RED_L=[253,236,234];
-    const soughtRow=[{content:T[lang].amountSought.toUpperCase(),
-      styles:{fontStyle:'bold',fontSize:9.5,textColor:[123,26,18],fillColor:RED_L,halign:'left'}}];
+    // Amount requested -- the headline figure for the funder
+    const soughtRow=[{content:pdfTxt(T[lang].amountSought.toUpperCase()),
+      styles:{fontStyle:'bold',textColor:RED_D,fillColor:RED_L,halign:'left',valign:'middle'}}];
     yr.forEach(y=>{
       soughtRow.push({content:pdfFmt(yearSought(y)),
-        styles:{halign:'right',fontStyle:'bold',fontSize:9.5,fillColor:RED_L,textColor:[123,26,18]}});
+        styles:{halign:'right',valign:'middle',fontStyle:'bold',fillColor:RED_L,textColor:RED_D}});
     });
     soughtRow.push({content:pdfFmt(amountSought()),
-      styles:{halign:'right',fontStyle:'bold',fontSize:11,fillColor:RED_L,textColor:[123,26,18]}});
+      styles:{halign:'right',valign:'middle',fontStyle:'bold',fillColor:RED_L,textColor:RED_D}});
     gtBody.push(soughtRow);
   }
 
@@ -1861,15 +1915,25 @@ window.exportPDF=function(){
   doc.autoTable({
     head:gtHead,body:gtBody,
     startY:yPos,margin:{left:MARGIN,right:MARGIN},tableWidth:TBL_W,
-    styles:{fontSize:8,cellPadding:[2,3],lineColor:[192,57,43],lineWidth:0.3,textColor:DARK},
-    headStyles:{fillColor:BLUE_H,textColor:[255,255,255],fontStyle:'bold',fontSize:8.5,halign:'right'},
+    styles:{
+      font:'helvetica', fontSize:FS, cellPadding:PAD,
+      lineColor:[192,57,43], lineWidth:0.25, textColor:DARK,
+      overflow:'linebreak', valign:'middle', minCellHeight:ROW_H,
+    },
+    headStyles:{
+      fillColor:BLUE_H, textColor:[255,255,255], fontStyle:'bold',
+      fontSize:FS, minCellHeight:HEAD_H, valign:'middle',
+    },
+    bodyStyles:{ fontSize:FS, minCellHeight:ROW_H, valign:'middle' },
     columnStyles:gtCS,
     didParseCell(d){
+      // Uniform size everywhere: emphasis comes from weight and fill only
+      d.cell.styles.fontSize = FS;
+      d.cell.styles.valign   = 'middle';
       if(d.section==='body'){
-        // Special (styled) rows at the end: grand total + optional overhead + optional co-fin(2)
-        let nSpec=1;
-        if(overheadPct>0) nSpec++;
-        if(coFinTotal()>0) nSpec+=2;
+        let nSpec=1;                      // grand total row
+        if(overheadPct>0) nSpec++;        // + overhead row
+        if(coFinTotal()>0) nSpec+=2;      // + co-financing and requested rows
         if(d.row.index<gtBody.length-nSpec && d.row.index%2===1){
           d.cell.styles.fillColor=[250,250,248];
         }
@@ -1882,7 +1946,7 @@ window.exportPDF=function(){
   for(let i=1;i<=pc;i++){
     doc.setPage(i);
     doc.setFontSize(7);doc.setTextColor(...GREY2);doc.setFont(undefined,'normal');
-    doc.text(`${isDa?'Side':'Page'} ${i} / ${pc}`,PAGE_W-MARGIN,207,{align:'right'});
+    doc.text(pdfTxt(`${isDa?'Side':'Page'} ${i} / ${pc}`),PAGE_W-MARGIN,207,{align:'right'});
   }
 
   const safeName=(projTitle||'budget').replace(/[^a-zA-Z0-9æøåÆØÅ]/g,'_');
