@@ -1496,31 +1496,65 @@ window.exportPDF=function(){
   const isEUR=currency==='EUR';
   const curSym=isEUR?'EUR':'kr.';
 
-  // ── ASCII sanitizer ──
-  // jsPDF standard fonts use WinAnsi encoding. Any character outside it (U+2212
-  // minus, U+00A0 nbsp, smart quotes, em dash, euro sign) forces jsPDF into a
-  // UTF-16 path, which renders as a stray quote mark plus null-byte "letter
-  // spacing". Everything written to the PDF must pass through this first.
+  // -- ASCII sanitizer --------------------------------------------------
+  // jsPDF's built-in fonts use WinAnsi encoding. A single character outside
+  // that table (U+2212 true minus, U+00A0 nbsp, smart quotes, em dash, euro)
+  // makes jsPDF encode that WORD as UTF-16BE. Rendered with a Latin font the
+  // high byte of U+2212 (0x22) shows as a quote mark and every following ASCII
+  // digit gains a leading null byte -- which is the '" 3 0 0 . 0 0 0' artefact.
+  // Everything drawn into the PDF must pass through this.
   function pdfTxt(s){
     return String(s==null?'':s)
-      .replace(/\u2212/g,'-')        // minus sign  -> hyphen
-      .replace(/\u00a0/g,' ')        // nbsp        -> space
-      .replace(/[\u2013\u2014]/g,'-') // en/em dash  -> hyphen
-      .replace(/[\u2018\u2019]/g,"'")
-      .replace(/[\u201c\u201d]/g,'"')
+      .replace(/\u2212/g,'-')          // true minus     -> hyphen
+      .replace(/\u00a0|\u202f/g,' ')   // nbsp / narrow  -> space
+      .replace(/[\u2010-\u2015]/g,'-') // all dashes     -> hyphen
+      .replace(/[\u2018\u2019\u201a]/g,"'")
+      .replace(/[\u201c\u201d\u201e]/g,'"')
       .replace(/\u2026/g,'...')
-      .replace(/\u00b7/g,'-')
+      .replace(/\u00b7|\u2022/g,'-')
       .replace(/\u2248/g,'~')
-      .replace(/\u20ac/g,'EUR');     // euro sign   -> EUR
+      .replace(/\u20ac/g,'EUR')
+      // final safety net: drop anything still outside printable WinAnsi
+      .replace(/[^\n\x20-\x7E\xA1-\xFF]/g,'');
   }
 
-  // ── Currency formatter for PDF (pure ASCII output) ──
+  // -- Number grouping without toLocaleString ---------------------------
+  // Browsers with full ICU return U+2212 (not '-') for negative numbers in
+  // da-DK, and some locales use U+00A0 as the group separator. Formatting the
+  // digits by hand removes that entire class of failure.
+  function grp(n){
+    const s=String(Math.abs(Math.round(n)));
+    let out='';
+    for(let i=0;i<s.length;i++){
+      if(i>0 && (s.length-i)%3===0) out+='.';
+      out+=s[i];
+    }
+    return out;
+  }
+  function grpFte(f){
+    const r=Math.round(f*10)/10;
+    return String(r).replace('.',',');
+  }
+
+  // -- Currency formatter for PDF (pure ASCII output) -------------------
   function pdfFmt(dkk){
     const v=isEUR?Math.round(dkk/eurRate):Math.round(dkk);
     const neg=v<0;
-    const s=Math.abs(v).toLocaleString('da-DK');
-    const body=isEUR?('EUR '+s):(s+' kr.');
+    const body=isEUR?('EUR '+grp(v)):(grp(v)+' kr.');
     return (neg?'-':'')+body;
+  }
+
+  // -- Cell-level guard --------------------------------------------------
+  // Runs on every cell of every table. Even if a string reaches autoTable
+  // un-sanitised, its text is cleaned here before line-breaking and drawing.
+  function sanitizeCell(d){
+    if(Array.isArray(d.cell.text)){
+      d.cell.text=d.cell.text.map(t=>pdfTxt(t));
+    } else if(typeof d.cell.text==='string'){
+      d.cell.text=pdfTxt(d.cell.text);
+    }
+    d.cell.styles.fontSize=FS;
+    d.cell.styles.valign='middle';
   }
 
   const gt=grandTotal(); // always in DKK
@@ -1655,7 +1689,7 @@ window.exportPDF=function(){
       yr.forEach(y=>{
         if(cat.hasFte){
           const f=row.fte[y]||0;
-          cells.push({content:f>0?f.toLocaleString('da-DK',{minimumFractionDigits:1,maximumFractionDigits:1}):'-',styles:{halign:'right',valign:'middle'}});
+          cells.push({content:f>0?grpFte(f):'-',styles:{halign:'right',valign:'middle'}});
         }
         const b=rowBudget(row,y);
         cells.push({content:b>0?pdfFmt(b):'-',styles:{halign:'right',valign:'middle'}});
@@ -1725,9 +1759,7 @@ window.exportPDF=function(){
       bodyStyles:{ fontSize:FS, minCellHeight:ROW_H, valign:'middle' },
       columnStyles:cs,
       didParseCell(d){
-        // Force one uniform size on every cell — bold never changes scale
-        d.cell.styles.fontSize = FS;
-        d.cell.styles.valign   = 'middle';
+        sanitizeCell(d);
         if(d.section==='body'){
           const nSpecial=overheadPct>0?2:1; // subtotal + optional overhead
           if(d.row.index < bodyArr.length - nSpecial && d.row.index%2===1){
@@ -1809,8 +1841,7 @@ window.exportPDF=function(){
       bodyStyles:{ fontSize:FS, minCellHeight:ROW_H, valign:'middle' },
       columnStyles:cfCS,
       didParseCell(d){
-        d.cell.styles.fontSize = FS;
-        d.cell.styles.valign   = 'middle';
+        sanitizeCell(d);
         if(d.section==='body'&&d.row.index<cfBody.length-1&&d.row.index%2===1){
           d.cell.styles.fillColor=[245,251,247];
         }
@@ -1927,9 +1958,7 @@ window.exportPDF=function(){
     bodyStyles:{ fontSize:FS, minCellHeight:ROW_H, valign:'middle' },
     columnStyles:gtCS,
     didParseCell(d){
-      // Uniform size everywhere: emphasis comes from weight and fill only
-      d.cell.styles.fontSize = FS;
-      d.cell.styles.valign   = 'middle';
+      sanitizeCell(d);
       if(d.section==='body'){
         let nSpec=1;                      // grand total row
         if(overheadPct>0) nSpec++;        // + overhead row
